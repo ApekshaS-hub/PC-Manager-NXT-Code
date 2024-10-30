@@ -1,0 +1,535 @@
+<#
+.SYNOPSIS
+This script retrieves and manages system information related to downloaded files, duplicate files, large files,
+antivirus details, system clean-up, and installed applications.
+
+
+.DESCRIPTION
+The script uses various functions to gather system data and perform tasks like identifying downloaded, duplicate,
+and large files, gathering antivirus product information, gathering clean-up information, and fetching details of
+installed applications from multiple sources (Registry, MSI, and Store). 
+
+
+.INPUTS
+- $DirectoryForDownloadedFiles: Paths to directories for searching downloaded files.
+- $DirectoryforDuplicateFiles: Paths to check for duplicate files.
+- $DirectoryforLargeFiles: Paths to search for large files.
+- $ThresholdMB: Int - Size threshold (in MB) for identifying large files.
+
+
+.FUNCTIONALITY
+GetInfo
+
+.NOTES
+Provider:            Apeksha Shinde
+Context:             InteractiveUser
+Version:             1.0 - Initial release 
+Last Generated:      
+#>
+
+
+#
+#INPUT
+#
+
+param(
+
+    [Parameter(Mandatory = $true)][string]$DirectoryForDownloadedFiles,
+    [Parameter(Mandatory = $true)][string]$DirectoryforDuplicateFiles,
+    [Parameter(Mandatory = $true)][string]$DirectoryforLargeFiles,
+    [Parameter(Mandatory = $true)][int]$ThresholdMB
+    
+)
+
+#
+# Constants definition
+#
+
+$env:Path = 'C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\'
+
+New-Variable -Name 'ERROR_EXCEPTION_TYPE' `
+    -Value @{Environment = '[Environment error]'
+             Input = '[Input error]'
+             Internal = '[Internal error]'} 
+			 
+New-Variable -Name 'LOCAL_SYSTEM_IDENTITY' `
+    -Value 'S-1-5-18' -Option ReadOnly -Scope Script
+	
+New-Variable -Name 'REMOTE_ACTION_DLL_PATH' `
+    -Value "$env:NEXTHINK\RemoteActions\nxtremoteactions.dll" `
+    -Option ReadOnly -Scope Script
+
+New-Variable -Name 'PATHS' `
+    -Value @{'Windows_Update_Cleanup' = 'C:\Windows\SoftwareDistribution\DataStore\Logs'
+             'Windows_Error_Reports_and_Feedback_Diagnostics' = 'C:\ProgramData\Microsoft\Windows\WER\ReportArchive'
+             'Microsoft_Defender_Logs_and_Scan_History_Files' = 'C:\ProgramData\Microsoft\Windows Defender\Support'
+             'Chrome_GrShaderCache' = "$env:USERPROFILE\AppData\Local\Google\Chrome\User Data\GrShaderCache"
+             'Chrome_ShaderCache' = "$env:USERPROFILE\AppData\Local\Google\Chrome\User Data\ShaderCache"
+             'IE_Cache' = "$env:USERPROFILE\AppData\Local\Microsoft\Windows"             
+             'Device_Driver_Package' = 'C:\Windows\System32\DriverStore\FileRepository'             
+             'Temporary_Files' = [System.IO.Path]::GetTempPath()} `
+    -Option ReadOnly -Scope Script -Force
+	
+
+#
+# Invoke Main
+#
+
+function Invoke-Main {
+    $exitCode = 0
+    
+    try {
+        Add-NexthinkRemoteActionDLL
+        Test-RunningAsInteractiveUser
+        Get-AllAntivirusInformation
+        Get-LightCleenUp
+        Get-DeepCleanUpSize
+        Get-AllApplications
+        Get-DownloadedFiles
+        Get-LargeFiles
+        Get-DuplicateFiles
+        Check-WindowsUpdateStatus
+        #Start-Sleep -Seconds 2
+				       
+    } catch {
+        Write-StatusMessage -Message $_
+        $exitCode = 1
+    }
+
+    return $exitCode
+}
+
+
+function Add-NexthinkRemoteActionDLL {
+    if (-not (Test-Path -Path $REMOTE_ACTION_DLL_PATH)) {
+		throw "$($ERROR_EXCEPTION_TYPE.Environment) Nexthink Remote Action DLL not found."
+}
+    Add-Type -Path $REMOTE_ACTION_DLL_PATH
+}
+
+function Test-RunningAsInteractiveUser {
+    $currentIdentity = Get-CurrentIdentity
+    if ($currentIdentity -eq $LOCAL_SYSTEM_IDENTITY) {
+        throw 'This script must be run as InteractiveUser. '
+    }
+}
+
+function Get-CurrentIdentity {
+    return [Security.Principal.WindowsIdentity]::GetCurrent().User.ToString()
+}
+
+function Write-StatusMessage ([psobject]$Message) {
+    $exception = $Message.ToString()
+
+    if ($Message.InvocationInfo.ScriptLineNumber) {
+        $version = Get-ScriptVersion
+        if(-not [string]::IsNullOrEmpty($version)) {
+            $version = "Version: $version. "
+        }
+
+        $errorMessage = $version + "Line '$($Message.InvocationInfo.ScriptLineNumber)'. "
+    }
+
+    $host.ui.WriteErrorLine($errorMessage + $exception)
+}
+
+function Get-ScriptVersion {
+    $scriptContent = Get-Content $MyInvocation.ScriptName | Out-String
+    if ($scriptContent -notmatch '<#[\r\n]{2}.SYNOPSIS[^\#\>]*(.NOTES[^\#\>]*)\#>') { return }
+
+    $helpBlock = $Matches[1].Split([environment]::NewLine)
+
+    foreach ($line in $helpBlock) {
+        if ($line -match 'Version:') {
+            return $line.Split(':')[1].Split('-')[0].Trim()
+        }
+    }
+}
+
+
+#PC Manager Features
+##AllAntivirusInformation
+function Get-AllAntivirusInformation {
+    # Define the namespace for antivirus products in Windows Security Center
+    $NAMESPACE = "root/SecurityCenter2"
+    $antivirusProducts = Get-CimInstance -Namespace $NAMESPACE -ClassName "AntiVirusProduct" -ErrorAction SilentlyContinue
+    $AntivirusProperties = ""
+    $DefenderSpecificProperties = ""
+
+    if ($antivirusProducts) {
+        $antivirusProducts | ForEach-Object {
+            # Basic antivirus properties
+            $status = if ($_.productState -band 1) { "Enabled" } else { "Disabled" }
+            $signatureAge = (New-TimeSpan -Start $_.timestamp -End (Get-Date)).Days
+            $productName = $_.displayName
+            $lastUpdated = $_.timestamp
+            $signatureVersion = $_.definitionVersion
+       
+            if (-not $signatureVersion) {
+                $signatureVersion = "Not available"
+            }
+
+            $AntivirusProperties += $productName + ': Status=' + $status + ', SignatureAge=' + $signatureAge + ' Days, SignatureLastUpdated=' + $lastUpdated + ', SignatureVersion=' + $signatureVersion + "`r`n"
+            [Nxt]::WriteOutputString('AntivirusProperties', $AntivirusProperties)
+
+            # Additional properties for Windows Defender
+            if ($productName -match "Defender") {                
+                $defenderStatus = Get-MpComputerStatus
+                $defenderThreats = Get-MpThreatDetection
+                $ransomwareProtection = (Get-MpPreference).EnableControlledFolderAccess
+                
+                if ($defenderThreats) {
+                    $currentThreats = ($defenderThreats | Select-Object -ExpandProperty ThreatID -Unique -join ", ") -replace '^$', 'None'
+                } else {
+                    $currentThreats = 'None'
+                }
+                
+                if ($defenderStatus.LastQuickScanTime) {
+                    $lastScan = $defenderStatus.LastQuickScanTime
+                } else {
+                    $lastScan = "Not available"
+                }
+                
+                $DefenderSpecificProperties += "CurrentThreats=" + $currentThreats + ', LastScan=' + $lastScan + ', VirusAndThreatProtectionUpdates=' + $defenderStatus.AntivirusSignatureLastUpdated + ', RansomwareProtection=' + $ransomwareProtection + "`r`n"
+                [Nxt]::WriteOutputString('DefenderSpecificProperties', $DefenderSpecificProperties)
+            }
+        }
+    } else {      
+        $AntivirusProperties += "No antivirus product found on the local machine.`r`n"
+    }
+
+    Write-StatusMessage -Message "Antivirus information gathered successfully."
+}
+
+
+##LightCleenUp
+function Get-LightCleenUp {
+    $TempFolder = [System.IO.Path]::GetTempPath() 
+    $TempFiles = Get-ChildItem -Path $TempFolder -Recurse -File
+    $TotalTempSize = ($TempFiles | Measure-Object -Property Length -Sum).Sum / 1MB
+
+    $RecycleBin = New-Object -ComObject Shell.Application 
+    $RecycleBinItems = $RecycleBin.Namespace(0xA).Items()
+    $TotalRecycleBinSize = 0
+    foreach ($item in $RecycleBinItems) {
+        $TotalRecycleBinSize += $item.Size
+    }
+
+    $TotalTempSizeRounded = [math]::Round($TotalTempSize, 2)
+    $TotalRecycleBinSizeRounded = [math]::Round($TotalRecycleBinSize / 1MB, 2)
+
+    $TempSize = "$TotalTempSizeRounded MB"
+    $RecycleBinSize = "$TotalRecycleBinSizeRounded MB"
+
+    $LightCleanUpSize = "TotalTemporaryFileSize=" + $TempSize + ", TotalRecycleBinSize=" + $RecycleBinSize
+    $LightTotalSize = $TotalTempSizeRounded + $TotalRecycleBinSizeRounded
+    $TotalSize = "$LightTotalSize MB"
+
+    [Nxt]::WriteOutputString('LightCleanUpSize', $LightCleanUpSize)
+    [Nxt]::WriteOutputString('TotalLightCleenUpSize', $TotalSize)
+    Write-StatusMessage -Message 'LightCleanUpsize successfully displayed'
+}
+
+
+##DeepCleanUpSize
+function Get-DeepCleanUpSize {
+    $Path = $PATHS
+    $totaldeepSize = 0
+    $Directories = ""
+
+    foreach ($name in $Path.Keys) {
+        if (-Not (Test-Path -Path $Path[$name])) {
+            Write-StatusMessage -Message "Path does not exist: $name - $($PATHS[$name])"
+            continue
+        }
+
+        try {
+            
+            $files = Get-ChildItem -Path $Path[$name] -Recurse -File -ErrorAction Stop
+            $size = ($files | Measure-Object -Property Length -Sum).Sum / 1MB
+            $size = [math]::Round($size, 2)
+            $totaldeepSize += $size
+
+            $Directories += $name + ': ' + $size + " MB`r`n" 
+        }
+        catch {
+            if ($_.Exception.Message -match "Access to the path") {
+                Write-StatusMessage -Message "Skipping protected directory: $name (Access denied)"
+            } else {
+                Write-StatusMessage -Message "Failed to get size for directory: $name. Error: $_.Exception.Message"
+            }
+        }
+    }
+
+    $totaldeepSize = [math]::Round($totaldeepSize, 2)
+    $totaldeepSizeString = "$totaldeepSize MB"
+
+    if ($Directories -ne "") {
+        [Nxt]::WriteOutputString('IndivisualDirectoriesSize', $Directories)
+    }
+
+    [Nxt]::WriteOutputString('TotalDeepCleanUpSize', $totaldeepSizeString)
+    Write-StatusMessage -Message 'DeepCleanUpSize successfully displayed'
+}
+
+
+##AllApplications
+function Get-AllApplications {
+    $csvPath = "$env:TEMP\ApplicationsList.csv"
+
+    $registryPaths = @(
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+
+    $registryApps = $registryPaths | ForEach-Object {
+        Get-ItemProperty $_ -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object {
+            [PSCustomObject]@{
+                ApplicationName = $_.DisplayName
+                InstallationType = if ($_.PSPath -like "*HKCU*") { "User Installed" } else { "System Installed" }
+                Source = "Registry"
+            }
+        }
+    }
+
+    $msiApps = Get-WmiObject -Query "SELECT * FROM Win32_Product" | ForEach-Object {
+        [PSCustomObject]@{
+            ApplicationName = $_.Name
+            InstallationType = "System Installed"
+            Source = "MSI"
+        }
+    }
+
+    $storeApps = Get-AppxPackage | ForEach-Object {
+        [PSCustomObject]@{
+            ApplicationName = $_.Name
+            InstallationType = "User Installed"
+            Source = "Store"
+        }
+    }
+
+    $allApps = $registryApps + $msiApps + $storeApps #| Sort-Object ApplicationName -Unique
+    $allApps | Export-Csv -Path $csvPath -NoTypeInformation
+
+    $summaryOutput = "Registry: $($registryApps.Count), MSI: $($msiApps.Count), Store: $($storeApps.Count)`r`n"
+    $summaryOutput += "Total Applications: $($allApps.Count)`r`n"
+    [Nxt]::WriteOutputString('ApplicationCounts', $summaryOutput)
+
+    $top10Apps = $allApps | Sort-Object ApplicationName | Select-Object -First 10
+    $Top10AppList = ""
+    foreach ($app in $top10Apps) {
+        $Top10AppList += "$($app.ApplicationName) - $($app.InstallationType)`r`n"
+        [Nxt]::WriteOutputString('TopApplications', $Top10AppList)
+    }
+    Write-StatusMessage -Message "All installed application are displayed & CSV exported to: $csvPath"
+}
+
+
+##DownloadedFiles
+function Get-DownloadedFiles { 
+    $directories = $DirectoryForDownloadedFiles -split ',' | ForEach-Object { $_.Trim() }
+    $downloadedFiles = @()
+    $validPaths = @()
+
+    foreach ($rootPath in $directories) {
+        if (Test-Path $rootPath) {
+            $validPaths += $rootPath
+        } else {
+            Write-StatusMessage -Message "Path not found: $rootPath"
+        }
+    }
+
+    if ($validPaths.Count -eq 0) {
+        Write-StatusMessage -Message "No DownloadedFiles path found."
+        return
+    }
+
+    foreach ($rootPath in $validPaths) {
+        $downloadedFiles += Get-ChildItem -Path $rootPath -File -Recurse -ErrorAction SilentlyContinue | 
+                            Select-Object FullName, LastWriteTime, 
+                                          @{Name='SizeMB'; Expression={[math]::Round($_.Length / 1MB, 2)}}, 
+                                          Length, Attributes, Extension
+    }
+
+    if ($downloadedFiles.Count -eq 0) {
+        Write-StatusMessage -Message "No downloaded files found."
+        return
+    } else {
+        $count = $downloadedFiles.Count
+        [Nxt]::WriteOutputString('DownloadFileCount', $count)
+    }
+
+    foreach ($file in $downloadedFiles) {
+        if ($file.Attributes -match "Archive, ReparsePoint") {
+            $file | Add-Member -MemberType NoteProperty -Name 'OneDriveStatus' -Value 'Available on this device'
+        } elseif ($file.Attributes -eq 4199968) {  # 4199968 is the numeric value for "Offline"
+            $file | Add-Member -MemberType NoteProperty -Name 'OneDriveStatus' -Value 'Available when Online'
+        } else {
+            $file | Add-Member -MemberType NoteProperty -Name 'OneDriveStatus' -Value 'Unknown'
+        }
+    }
+
+    $csvPath = "$env:LOCALAPPDATA\Temp\DownloadedFiles.csv"
+    $downloadedFiles | Export-Csv -Path $csvPath -NoTypeInformation -Force
+    Write-StatusMessage -Message "Downloaded file list exported to: $csvPath"
+
+    $totalSizeMB = [math]::Round(($downloadedFiles | Measure-Object -Property Length -Sum).Sum / 1MB, 2)
+    $totalSize = "$totalSizeMB MB"
+    [Nxt]::WriteOutputString('TotalDownloadedFileSize', $totalSize)
+}
+
+
+##LargeFiles
+function Get-LargeFiles {
+    $baseDirectory = "$env:temp"
+    $csvFileName = "LargeFiles.csv"
+    $largeFilePath = Join-Path -Path $baseDirectory -ChildPath $csvFileName
+
+    if (-not (Test-Path $baseDirectory)) {
+        New-Item -Path $baseDirectory -ItemType Directory -Force
+    }
+
+    $files = @()
+    # Split the DirectoryforLargeFiles variable into an array of directories
+    $directories = $DirectoryforLargeFiles -split ',' | ForEach-Object { $_.Trim() }
+
+    foreach ($rootPath in $directories) {
+        $files += Get-ChildItem -Path $rootPath -Recurse -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Length -gt ($ThresholdMB * 1MB) }
+        # Write-StatusMessage -Message "Large Files are searching in path: $rootPath"
+    }
+
+    if ($files.Count -eq 0) {
+        Write-StatusMessage -Message "No large files found. Check paths and threshold."
+        return
+    }
+
+    # Count of found large files
+    $count = $files.Count
+    [Nxt]::WriteOutputString('LargeFileCount', $count)
+
+    foreach ($file in $files) {
+        if ($file.Attributes -match "Archive, ReparsePoint") {
+            $file | Add-Member -MemberType NoteProperty -Name 'OneDriveStatus' -Value 'Available on this device'
+        } elseif ($file.Attributes -eq 4199968) {  # 4199968 is the numeric value for "Offline"
+            $file | Add-Member -MemberType NoteProperty -Name 'OneDriveStatus' -Value 'Available when Online'
+        } else {
+            $file | Add-Member -MemberType NoteProperty -Name 'OneDriveStatus' -Value 'Unknown'
+        }
+    }
+
+    $totalLargeFileSize = [math]::Round(($files | Measure-Object -Property Length -Sum).Sum / 1MB, 2)
+    $LargeFileSize = "$totalLargeFileSize MB"
+
+    try {
+        $files | Select-Object FullName, 
+                              @{Name="ModifiedDate"; Expression = {$_.LastWriteTime.ToString("yyyy-MM-dd")}}, 
+                              @{Name="SizeMB"; Expression = {[math]::Round($_.Length / 1MB, 2)}}, 
+                              Attributes, Extension, OneDriveStatus | Export-Csv -Path $largeFilePath -NoTypeInformation
+
+        [Nxt]::WriteOutputString('TotalLargeFileSize', $LargeFileSize)
+        Write-StatusMessage -Message "Large file list exported successfully to: $largeFilePath"
+    } catch {
+        Write-StatusMessage -Message "Failed to export CSV: $_"
+    }
+}
+
+
+##DuplicateFiles
+function Get-DuplicateFiles {
+    $directories = $DirectoryforDuplicateFiles -split ',' | ForEach-Object { $_.Trim() }
+    $duplicateList = @()
+    $totalDuplicateSize = 0
+    $totalDuplicateFileCount = 0
+
+    foreach ($directory in $directories) {
+        try {
+            if (-not (Test-Path $directory)) {
+                Write-StatusMessage -Message "Path not found or contains illegal characters: $directory"
+                continue
+            }
+        } catch {
+            Write-StatusMessage -Message "Illegal characters found in path: $directory"
+            continue
+        }
+
+        $fileList = Get-ChildItem -Path $directory -File -Recurse -ErrorAction SilentlyContinue
+
+        foreach ($file in $fileList) {
+            if ($file.Attributes -match "Archive, ReparsePoint") {
+                $file | Add-Member -MemberType NoteProperty -Name 'OneDriveStatus' -Value 'Available on this device'
+            } elseif ($file.Attributes -eq 4199968) {
+                $file | Add-Member -MemberType NoteProperty -Name 'OneDriveStatus' -Value 'Available when Online'
+            } else {
+                $file | Add-Member -MemberType NoteProperty -Name 'OneDriveStatus' -Value 'Unknown'
+            }
+        }
+
+        $fileObjects = $fileList | ForEach-Object {
+            [PSCustomObject]@{
+                FullName       = $_.FullName
+                Name           = $_.Name
+                LastWriteTime  = $_.LastWriteTime
+                SizeMB         = [math]::Round($_.Length / 1MB, 2)
+                Hash           = (Get-FileHash $_.FullName -Algorithm MD5).Hash
+                Attributes     = $_.Attributes
+                Extension      = $_.Extension
+                OneDriveStatus = $_.OneDriveStatus
+            }
+        }
+
+        $duplicates = $fileObjects | Group-Object -Property Hash | Where-Object { $_.Count -gt 1 }
+        if ($duplicates.Count -eq 0) { Write-StatusMessage -Message "No duplicates found in: $directory" }
+
+        $allDuplicates = $duplicates | ForEach-Object { $_.Group | Select-Object -Skip 1 }
+        $totalDuplicateFileCount += $allDuplicates.Count
+
+        foreach ($d in $duplicates) {
+            $duplicatesToExport = $d.Group | Select-Object -Skip 1
+            $duplicateList += $duplicatesToExport
+            $totalDuplicateSize += ($duplicatesToExport | Measure-Object -Property SizeMB -Sum).Sum
+        }
+    }
+
+    $csvPath = "$env:LOCALAPPDATA\Temp\DuplicateFiles.csv"
+    if ($duplicateList.Count -gt 0) {
+        $duplicateList | Export-Csv -Path $csvPath -NoTypeInformation -Force
+        Write-StatusMessage -Message "Duplicate file list exported to: $csvPath"
+    } else {
+        Write-StatusMessage -Message "No duplicates to export."
+    }
+
+    $totalSizeMB = [math]::Round($totalDuplicateSize, 2)
+    $totalSize = "$totalSizeMB MB"
+    [Nxt]::WriteOutputString('TotalDuplicateFileSize', $totalSize)
+    [Nxt]::WriteOutputString('DuplicateFileCount', $totalDuplicateFileCount)
+}
+
+
+##WindowsUpdateStatus
+function Check-WindowsUpdateStatus {
+    $installedUpdates = Get-HotFix
+
+    $updateSession = New-Object -ComObject Microsoft.Update.Session
+    $updateSearcher = $updateSession.CreateUpdateSearcher()
+    $searchResult = $updateSearcher.Search("IsInstalled=0")
+
+    if ($searchResult.Updates.Count -eq 0) {
+        Write-StatusMessage -Message 'Windows is up-to-date'
+    } else {
+        Write-StatusMessage -Message 'There are pending updates'
+
+        $updateTitle = ""
+
+        foreach ($update in $searchResult.Updates) {
+            $updateTitle += $update.Title + "`r`n"  
+            [Nxt]::WriteOutputString('PendingUpdates', [string]$updateTitle)
+        }        
+    }
+
+    Write-StatusMessage -Message 'WindowsUpdate Checked successfully'
+}
+
+#end
+[environment]::Exit((Invoke-Main))
